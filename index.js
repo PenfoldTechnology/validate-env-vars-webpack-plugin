@@ -1,8 +1,8 @@
 /** @typedef {import("webpack/lib/Module")} Module */
 
 /**
- * @callback EnvVarCheckFunc
- * @param envVar {String}  name of the env var
+ * @callback BooleanCheckFunc
+ * @param input {String} input string
  * @returns {Boolean}
  */
 
@@ -24,6 +24,8 @@
 
 const fs = require("fs");
 const WebpackError = require("webpack/lib/WebpackError");
+const walk = require("acorn-walk");
+const debug = require("debug")("ValidateEnvVarsPlugin");
 
 const PLUGIN_NAME = "ValidateEnvVars";
 
@@ -32,8 +34,8 @@ class BadArgsError extends Error {
    * @param message {String}
    */
   constructor(message) {
-    super(`${PLUGIN_NAME}: ${message}`);
-    this.name = "BadArgsError";
+    super(message);
+    this.name = "ValidateEnvVarsPluginBadArgsError";
   }
 }
 
@@ -60,7 +62,7 @@ function hasAllProperties(object, properties) {
 }
 
 function toQuotedStringList(arr) {
-  return `'${arr.join("', '")}'`;
+  return arr.map((value) => `'${value}'`).join(", ");
 }
 
 function createExternalSourceCheck(sourceName, sourceRequiredInputProperties) {
@@ -131,49 +133,18 @@ function getAWSSecretsManagerEnvVarNames(sourceOptions) {
           return;
         }
 
-        let parsed;
-
         try {
-          parsed = JSON.parse(data.SecretString);
+          resolve(Object.keys(JSON.parse(data.SecretString)));
         } catch (err) {
-          err.message = `${PLUGIN_NAME}: failed parsing SecretString: ${err.message}`;
+          err.message = `${PLUGIN_NAME} failed parsing SecretString: ${err.message}`;
           reject(err);
-          return;
         }
-
-        resolve(Object.keys(parsed));
       }
     );
   });
 }
 
 class ValidateEnvVarsPlugin {
-  /**
-   * @param ignoreEnvVars {Array<String|RegExp>}
-   * @returns {EnvVarCheckFunc[]}
-   * @private
-   */
-  _processIgnoreEnvVars(ignoreEnvVars) {
-    if (!ignoreEnvVars) {
-      return [];
-    }
-
-    if (!Array.isArray(ignoreEnvVars)) {
-      throw new BadArgsError("expected ignoreEnvVars to be String|RegExp[]");
-    }
-
-    return ignoreEnvVars.map((name) => {
-      if (name instanceof RegExp) {
-        return (input) => /** @type RegExp */ (name).test(input);
-      } else if (typeof name === "string") {
-        name = name.replace(/^process\.env\./, "");
-        return (input) => input === name;
-      } else {
-        throw new BadArgsError("expecting ignoreEnvVars to be String|RegExp[]");
-      }
-    });
-  }
-
   /**
    * @param [knownEnvVars] {KnownEnvVarsArg}
    * @returns {Promise<String[]>}
@@ -224,6 +195,33 @@ class ValidateEnvVarsPlugin {
   }
 
   /**
+   * @param name {String} name of the input
+   * @param arr {[String|RegExp]}
+   * @param stringCheck {function(str: String, input: String): Boolean}
+   * @returns {BooleanCheckFunc[]}
+   * @private
+   */
+  _processStringOrRegexArrayInput(name, arr, stringCheck) {
+    if (!arr) {
+      return [];
+    }
+
+    if (!Array.isArray(arr)) {
+      throw new BadArgsError(`expected ${name} to be String|RegExp[]`);
+    }
+
+    return arr.map((value) => {
+      if (value instanceof RegExp) {
+        return (input) => /** @type RegExp */ (value).test(input);
+      } else if (typeof value === "string") {
+        return (input) => stringCheck(value, input);
+      } else {
+        throw new BadArgsError(`expecting ${value} to be [String|RegExp]`);
+      }
+    });
+  }
+
+  /**
    * Determine if envVar is considered recognised, ie. do not produce error for it.
    * @param knownEnvVars {String[]}
    * @param envVar {String}
@@ -232,82 +230,106 @@ class ValidateEnvVarsPlugin {
    * @private
    */
   _isRecognisedEnvVar(knownEnvVars, envVar, modulePath) {
-    return (
-        // Env vars that are in knownEnvVars are OK
-      knownEnvVars.includes(envVar) ||
-      // Ignore env vars inside excluded paths
-      this.excludePaths.some((path) => modulePath.startsWith(path)) ||
-      // Ignore env vars outside included paths
-      !this.includePaths.some((path) => modulePath.startsWith(path)) ||
-      // Ignore env vars we have already seen
-      this.foundUnrecognisedEnvVars.has(envVar) ||
-      // Ignore env vars that satisfy any ignoreEnvVars checks
-      this.ignoreEnvVars.some((check) => check(envVar))
-    );
+    // Env vars that are in knownEnvVars are OK
+    if (knownEnvVars.includes(envVar)) {
+      debug(envVar, "in knownEnvVars");
+      return true;
+    }
+    // Env vars we have seen before are OK
+    if (this.foundUnrecognisedEnvVars.has(envVar)) {
+      debug(envVar, "in foundUnrecognisedEnvVars");
+      return true;
+    }
+    // Env vars not inside included paths are OK
+    if (!this.includePaths.some((check) => check(modulePath))) {
+      debug(envVar, "outside includePaths");
+      return true;
+    }
+    // Env vars inside excluded paths are OK
+    if (this.excludePaths.some((check) => check(modulePath))) {
+      debug(envVar, "in excludePaths");
+      return true;
+    }
+    // Env vars that satisfy an ignore check are OK
+    if (this.ignoreEnvVars.some((check) => check(envVar))) {
+      debug(envVar, "in ignoreEnvVars");
+      return true;
+    }
+    // All other env vars are unrecognised
+    debug(envVar, "unrecognised");
+    return false;
   }
 
   /**
-   * @param options {Object}
+   * @param [options] {Object}
    * @param [options.knownEnvVars] {KnownEnvVarsArg} list of recognised env var names, default=derived from process.env
    * @param [options.knownEnvVarsTimeout] {Number} amount of time in ms to wait trying to resolve
    *     knownEnvVars before bailing, default=5000
-   * @param [options.ignoreEnvVars] {Array<String|RegExp>} list of env var names to ignore
+   * @param [options.ignoreEnvVars] {[String|RegExp]} list of env var names to ignore
    * @param [options.includePaths] {String[]} list of file paths to include in the search
    * @param [options.excludePaths] {String[]} list of file paths to exclude from the search
    */
-  constructor(options) {
+  constructor(options = {}) {
     /** @type Number */
     this.knownEnvVarsTimeout = 5000;
-
     /** @type Promise<String[]> */
     this.knownEnvVars = this._processKnownEnvVars(options.knownEnvVars);
-
     // Contains found env vars that are considered unrecognised, ie. are not defined by knownEnvVars
     /** @type Map<String, Module> */
     this.foundUnrecognisedEnvVars = new Map();
-
-    /** @type EnvVarCheckFunc[] */
-    this.ignoreEnvVars = this._processIgnoreEnvVars(options.ignoreEnvVars);
-
-    /** @type String[] */
-    this.includePaths = Array.isArray(options.includePaths)
-      ? options.includePaths
-      : [];
-
-    /** @type String[] */
-    this.excludePaths = Array.isArray(options.excludePaths)
-      ? options.excludePaths
-      : [];
+    /** @type BooleanCheckFunc[] */
+    this.ignoreEnvVars = this._processStringOrRegexArrayInput(
+      "ignoreEnvVars",
+      options.ignoreEnvVars,
+      (check, input) => check === input.replace(/^process\.env\./, "")
+    );
+    /** @type BooleanCheckFunc[] */
+    this.includePaths = this._processStringOrRegexArrayInput(
+      "includePaths",
+      options.includePaths,
+      (check, input) => input.startsWith(check)
+    );
+    /** @type BooleanCheckFunc[] */
+    this.excludePaths = this._processStringOrRegexArrayInput(
+      "excludePaths",
+      options.excludePaths,
+      (check, input) => input.startsWith(check)
+    );
   }
 
   apply(compiler) {
+    const _this = this;
+
     // Resolved value of this.knownEnvVars Promise
     let knownEnvVars;
 
-    const handler = (parser) => {
-      parser.hooks.evaluate
-        .for("MemberExpression")
-        .tap(PLUGIN_NAME, (expression) => {
-          if (
-            // Look for member expressions like `process.env.ENV_VAR`
-            expression.object.type === "MemberExpression" &&
-            expression.object.object.type === "Identifier" &&
-            expression.object.object.name === "process" &&
-            expression.object.property.name === "env" &&
-            // Ignore computed member expressions like `process.env[envVar]`
-            !expression.computed
-          ) {
-            // Gets "ENV_VAR" from the example member expression above
-            const name = expression.property.name;
-            // Gets the the Module (file) that this expression was found in
-            const module = parser.state.module;
-            const { userRequest: modulePath } = module;
+    const tapParser = (parser) => {
+      parser.hooks.program.tap(PLUGIN_NAME, (program) => {
+        walk.simple(program, {
+          MemberExpression(expression) {
+            if (
+              // Look for member expressions like `process.env.ENV_VAR`
+              expression.object.type === "MemberExpression" &&
+              expression.object.object.type === "Identifier" &&
+              expression.object.object.name === "process" &&
+              expression.object.property.type === "Identifier" &&
+              expression.object.property.name === "env" &&
+              // Ignore computed member expressions like `process.env[envVar]`
+              !expression.computed
+            ) {
+              // Gets "ENV_VAR" from the example member expression above
+              const name = expression.property.name;
+              // Gets the the Module (file) that this expression was found in
+              const module = parser.state.module;
+              const { userRequest: modulePath } = module;
 
-            if (!this._isRecognisedEnvVar(knownEnvVars, name, modulePath)) {
-              this.foundUnrecognisedEnvVars.set(name, module);
+              if (!_this._isRecognisedEnvVar(knownEnvVars, name, modulePath)) {
+                _this.foundUnrecognisedEnvVars.set(name, module);
+              }
             }
-          }
+          },
         });
+      });
     };
 
     // Hold up compilation until we have resolved the knownEnvVars Promise
@@ -336,13 +358,13 @@ class ValidateEnvVarsPlugin {
       (compilation, { normalModuleFactory }) => {
         normalModuleFactory.hooks.parser
           .for("javascript/auto")
-          .tap(PLUGIN_NAME, handler);
+          .tap(PLUGIN_NAME, tapParser);
         normalModuleFactory.hooks.parser
           .for("javascript/dynamic")
-          .tap(PLUGIN_NAME, handler);
+          .tap(PLUGIN_NAME, tapParser);
         normalModuleFactory.hooks.parser
           .for("javascript/esm")
-          .tap(PLUGIN_NAME, handler);
+          .tap(PLUGIN_NAME, tapParser);
       }
     );
 

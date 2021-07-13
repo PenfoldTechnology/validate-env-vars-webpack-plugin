@@ -70,7 +70,7 @@ knownEnvVars: path.resolve(__dirname, "../.env")
 
 ### `includePaths`
 
-- type: `String[]`
+- type: `[String|RegExp]`
 - default: `[]`
 
 Defines the file paths to include in the validation.
@@ -79,9 +79,9 @@ Defines the file paths to include in the validation.
 includePaths: [path.resolve(__dirname, "src")]
 ```
 
-### `ignorePaths`
+### `excludePaths`
 
-- type: `String[]`
+- type: `[String|RegExp]`
 - default: `[]`
 
 Defines the file paths to ignore in the validation.
@@ -89,7 +89,7 @@ Defines the file paths to ignore in the validation.
 Example:
 
 ```javascript
-ignorePaths: [path.resolve(__dirname, "src/generated")]
+excludePaths: [path.resolve(__dirname, "src/generated")]
 ```
 
 ### `ignoreEnvVars`
