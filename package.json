@@ -1,6 +1,6 @@
 {
   "name": "@penfold/validate-env-vars-webpack-plugin",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "main": "index.js",
   "repository": "https://github.com/PenfoldTechnology/validate-env-vars-webpack-plugin.git",
   "author": "Sam Gluck <sdgluck@gmail.com>",
